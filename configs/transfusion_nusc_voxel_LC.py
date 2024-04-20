@@ -5,7 +5,7 @@ class_names = [
 ]
 voxel_size = [0.075, 0.075, 0.2]
 out_size_factor = 8
-evaluation = dict(interval=1)
+evaluation = dict(interval=3)
 dataset_type = 'NuScenesDataset'
 data_root = 'data/nuscenes/'
 input_modality = dict(
@@ -87,7 +87,7 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=2,
+    samples_per_gpu=16,
     workers_per_gpu=6,
     train=dict(
         type='CBGSDataset',
@@ -264,7 +264,7 @@ log_config = dict(
 dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = None
-load_from = 'checkpoints/fusion_voxel0075_R50.pth'
+load_from = 'ckpt/transfusion_untrained_LC.pth'  # 'checkpoints/fusion_voxel0075_R50.pth'
 resume_from = None
 workflow = [('train', 1)]
 gpu_ids = range(0, 8)
