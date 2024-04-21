@@ -87,8 +87,8 @@ test_pipeline = [
         ])
 ]
 data = dict(
-    samples_per_gpu=16,
-    workers_per_gpu=6,
+    samples_per_gpu=2,
+    workers_per_gpu=2,
     train=dict(
         type='CBGSDataset',
         dataset=dict(

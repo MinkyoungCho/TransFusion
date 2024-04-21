@@ -7,7 +7,7 @@
 #SBATCH --ntasks-per-node=1           # Number of tasks (processes) per node
 #SBATCH --cpus-per-task=4             # Number of CPU cores per task
 #SBATCH --mem-per-gpu=40G             # Memory per GPU
-#SBATCH --time=47:50:00               # Maximum execution time (HH:MM:SS)
+#SBATCH --time=45:50:00               # Maximum execution time (HH:MM:SS)
 #SBATCH --output=output/test_job.%j.out    # Output file
 #SBATCH --error=output/test_job.%j.err     # Error file
 #SBATCH --mail-user minkycho@umich.edu

@@ -457,7 +457,18 @@ class LoadMultiViewImageFromFiles(object):
                 - scale_factor (float): Scale factor.
                 - img_norm_cfg (dict): Normalization configuration of images.
         """
+        import os
+
         filename = results['img_filename']
+        
+        for f_idx, f_name in enumerate(filename):
+            if "/y/minkycho" in f_name:
+                filename[f_idx] = f_name.replace("/y/minkycho", "/nfs/turbo/coe-zmao/minkycho")
+                import os
+                
+                if not os.path.exists(filename[f_idx]):
+                    filename[f_idx] = f_name.replace("/nfs/turbo/coe-zmao/minkycho/nuscenes_propertrain600_originalval", "/nfs/turbo/coe-zmao/nuscenes_old")
+
         if self.img_scale is None:
             img = np.stack(
                 [mmcv.imread(name, self.color_type) for name in filename], axis=-1)
