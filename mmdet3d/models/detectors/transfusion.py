@@ -165,7 +165,7 @@ class TransFusionDetector(MVXTwoStageDetector):
             pts_feats (list[torch.Tensor]): Features of point cloud branch
             gt_bboxes_3d (list[:obj:`BaseInstance3DBoxes`]): Ground truth
                 boxes for each sample.
-            gt_labels_3d (list[torch.Tensor]): Ground truth labels for
+        gt_labels_3d (list[torch.Tensor]): Ground truth labels for
                 boxes of each sampole
             img_metas (list[dict]): Meta information of samples.
             gt_bboxes_ignore (list[torch.Tensor], optional): Ground truth
@@ -181,23 +181,23 @@ class TransFusionDetector(MVXTwoStageDetector):
 
     def simple_test_pts(self, x, x_img, img_metas, rescale=False):
         """Test function of point cloud branch."""
-        outs = self.pts_bbox_head(x, x_img, img_metas)
+        outs, top3_img_values, top3_pts_values, top3_img_indices, top3_pts_indices = self.pts_bbox_head(x, x_img, img_metas)
         bbox_list = self.pts_bbox_head.get_bboxes(
             outs, img_metas, rescale=rescale)
         bbox_results = [
             bbox3d2result(bboxes, scores, labels)
             for bboxes, scores, labels in bbox_list
         ]
-        return bbox_results
+        return bbox_results, top3_img_values, top3_pts_values, top3_img_indices, top3_pts_indices
 
-    def simple_test(self, points, img_metas, img=None, rescale=False):
+    def simple_test(self, points, img_metas, img=None, rescale=False, gt_bboxes_3d=None, gt_labels_3d=None):
         """Test function without augmentaiton."""
         img_feats, pts_feats = self.extract_feat(
             points, img=img, img_metas=img_metas)
 
         bbox_list = [dict() for i in range(len(img_metas))]
         if pts_feats and self.with_pts_bbox:
-            bbox_pts = self.simple_test_pts(
+            bbox_pts, top3_img_values, top3_pts_values, top3_img_indices, top3_pts_indices = self.simple_test_pts(
                 pts_feats, img_feats, img_metas, rescale=rescale)
             for result_dict, pts_bbox in zip(bbox_list, bbox_pts):
                 result_dict['pts_bbox'] = pts_bbox
@@ -206,4 +206,4 @@ class TransFusionDetector(MVXTwoStageDetector):
                 img_feats, img_metas, rescale=rescale)
             for result_dict, img_bbox in zip(bbox_list, bbox_img):
                 result_dict['img_bbox'] = img_bbox
-        return bbox_list
+        return bbox_list, top3_img_values, top3_pts_values, top3_img_indices, top3_pts_indices

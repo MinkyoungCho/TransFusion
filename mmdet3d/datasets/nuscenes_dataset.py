@@ -225,7 +225,10 @@ class NuScenesDataset(Custom3DDataset):
                 lidar2cam_rt = np.eye(4)
                 lidar2cam_rt[:3, :3] = lidar2cam_r.T
                 lidar2cam_rt[3, :3] = -lidar2cam_t
-                intrinsic = cam_info['cam_intrinsic']
+                if 'cam_intrinsic' in cam_info:
+                    intrinsic = cam_info['cam_intrinsic']
+                else:
+                    intrinsic = cam_info['camera_intrinsics']
                 viewpad = np.eye(4)
                 viewpad[:intrinsic.shape[0], :intrinsic.shape[1]] = intrinsic
                 lidar2img_rt = (viewpad @ lidar2cam_rt.T)
@@ -237,7 +240,7 @@ class NuScenesDataset(Custom3DDataset):
                     lidar2img=lidar2img_rts,
                 ))
 
-        if not self.test_mode:
+        if True: #not self.test_mode:
             annos = self.get_ann_info(index)
             input_dict['ann_info'] = annos
 

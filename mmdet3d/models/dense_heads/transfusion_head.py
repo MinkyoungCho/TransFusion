@@ -20,6 +20,7 @@ from mmdet3d.models.fusion_layers import apply_3d_transformation
 from mmdet3d.ops.iou3d.iou3d_utils import nms_gpu
 from mmdet.core import build_bbox_coder, multi_apply, build_assigner, build_sampler, AssignResult
 from mmdet3d.ops.roiaware_pool3d import points_in_boxes_batch
+from mmdet3d.core.feature_aligner.aligner import FeatureAligner
 
 
 class PositionEmbeddingLearned(nn.Module):
@@ -78,8 +79,165 @@ class TransformerDecoderLayer(nn.Module):
 
     def with_pos_embed(self, tensor, pos_embed):
         return tensor if pos_embed is None else tensor + pos_embed
+    
 
-    def forward(self, query, key, query_pos, key_pos, attn_mask=None):
+    def compute_ncscore(self, img_output, pts_output):
+        curr_model = "/y/minkycho/transfusion_nusc_voxel_LC_sample1/2ndtrain.pth"
+        tmp = torch.load(curr_model)
+
+        feature_aligner = FeatureAligner(input_dim=128, hidden_dim=256, output_dim=128, mode="test")
+
+        centers = tmp["state_dict"]["pts_bbox_head.center_loss.centers"]
+
+        # Assuming feature_aligner has layers fc1 to fc8
+        for i in range(1, 9):
+            layer = getattr(feature_aligner, f'fc{i}')
+            
+            layer.weight = torch.nn.Parameter(
+                tmp[f"state_dict"][f"pts_bbox_head.feature_aligner.fc{i}.weight"]
+            )
+            layer.bias = torch.nn.Parameter(
+                tmp[f"state_dict"][f"pts_bbox_head.feature_aligner.fc{i}.bias"]
+            )
+
+        # assert (centers == tmp["state_dict"][f"pts_bbox_head.center_loss.centers"]).all()
+        # assert (feature_aligner.fc1.weight == tmp["state_dict"][f"pts_bbox_head.feature_aligner.fc1.weight"]).all()
+        # assert (feature_aligner.fc1.bias == tmp["state_dict"][f"pts_bbox_head.feature_aligner.fc1.bias"]).all()
+        # assert (feature_aligner.fc2.weight == tmp["state_dict"][f"pts_bbox_head.feature_aligner.fc2.weight"]).all()
+        # assert (feature_aligner.fc2.bias == tmp["state_dict"][f"pts_bbox_head.feature_aligner.fc2.bias"]).all()
+        # assert (feature_aligner.fc8.weight == tmp["state_dict"][f"pts_bbox_head.feature_aligner.fc8.weight"]).all()
+        # assert (feature_aligner.fc8.bias == tmp["state_dict"][f"pts_bbox_head.feature_aligner.fc8.bias"]).all()
+
+        img_output = img_output.permute(1, 0, 2)
+        pts_output = pts_output.permute(1, 0, 2)
+        img_feats_aligned = feature_aligner(img_output.cpu())
+        pts_feats_aligned = feature_aligner(pts_output.cpu())
+
+        classes = torch.arange(10).long()  # TODO: if use_gpu(), then cuda()
+
+        img_to_center = torch.cdist(
+            img_feats_aligned[0].double(), centers.double(), p=2
+        )  # [200, 10]
+        img_centers_idx = torch.argmin(img_to_center, dim=1)  # [200]
+        img_centers = centers[img_centers_idx]  # [200, 128]
+        
+        pts_to_center = torch.cdist(
+            pts_feats_aligned[0].double(), centers.double(), p=2
+        )
+        pts_centers_idx = torch.argmin(pts_to_center, dim=1)
+        pts_centers = centers[pts_centers_idx]
+        
+        top3_img_values, top3_img_indices = torch.topk(img_to_center, k=10, largest=False)
+        top3_pts_values, top3_pts_indices = torch.topk(pts_to_center, k=10, largest=False)
+        
+        # assert round(pts_to_center[100][4].item(), 3) == round(
+        #     torch.norm(
+        #         pts_feats_aligned[0][100].double() - centers[4].double(), p=2
+        #     ).item(),
+        #     3,
+        # )
+        # assert round(pts_to_center[0][0].item(), 3) == round(
+        #     torch.norm(
+        #         pts_feats_aligned[0][0].double() - centers[0].double(), p=2
+        #     ).item(),
+        #     3,
+        # )
+        # assert round(pts_to_center[10][1].item(), 3) == round(
+        #     torch.norm(
+        #         pts_feats_aligned[0][10].double() - centers[1].double(), p=2
+        #     ).item(),
+        #     3,
+        # )
+
+        # for i in range(20):
+        #     assert (
+        #         pts_centers[i] == centers[torch.argmin(pts_to_center, dim=1)[i]]
+        #     ).all()
+
+        ncscore_img = torch.norm(
+            img_feats_aligned[0] - img_centers, p=2, dim=1
+        )  # [900]
+        ncscore_pts = torch.norm(
+            pts_feats_aligned[0] - pts_centers, p=2, dim=1
+        )  # [900]
+            
+        return ncscore_img, ncscore_pts, img_centers_idx, pts_centers_idx, top3_img_values, top3_img_indices, top3_pts_values, top3_pts_indices
+
+
+    def dynamic_weighting(self, img_output, pts_output):
+        cam_consistency = torch.zeros(200, 10)
+        lidar_consistency = torch.zeros(200, 10)
+        
+        # print ("@@@@@ hi: dynamic_weighting.py")
+        if True: #not is_localization: # Fist Stage: Cam_On;y
+            cam_ncscore, lidar_ncscore, img_centers_idx, pts_centers_idx, top3_img_values, top3_img_indices, top3_pts_values, top3_pts_indices = self.compute_ncscore(img_output, pts_output) # img_output.shape == pts_output.shape == [1, 900, 256]
+            p_cam = None
+            p_lidar = None
+            
+            # print (cam_ncscore)
+            # print (lidar_ncscore)
+            # exit()
+            
+            # dummies...
+            # cam_consistency[torch.arange(cam_consistency.shape[0]), top3_img_indices[:, 0]] = 1 
+            # lidar_consistency[torch.arange(lidar_consistency.shape[0]), top3_pts_indices[:, 0]] = 1
+            cam_ranks = torch.ones(200)
+            lidar_ranks = torch.ones(200)
+            # indices_for_gathering = top3_img_indices[:, 0]
+            # cam_ranks = ((calib_values_matrix[indices_for_gathering] > cam_ncscore.unsqueeze(1)).sum(dim=1).float() / calib_lengths_vector[indices_for_gathering])
+            # indices_for_gathering = top3_pts_indices[:, 0]
+            # lidar_ranks = ((calib_values_matrix[indices_for_gathering] > lidar_ncscore.unsqueeze(1)).sum(dim=1).float() / calib_lengths_vector[indices_for_gathering])                    
+                
+            prev_cam_factor = None
+            prev_lidar_factor = None
+            
+            # print (img_output.shape)
+            
+            p_cam = lidar_ncscore / (cam_ncscore + lidar_ncscore) # [63]
+            p_lidar = cam_ncscore / (cam_ncscore + lidar_ncscore)
+            
+            p_cam = torch.where(p_cam >= 0.7, torch.tensor(0.5), p_cam) #w2
+            p_lidar =  torch.where(p_lidar <= 0.3, torch.tensor(0.5), p_lidar) #w2
+            # print (f"{p_cam.mean()} {p_lidar.mean()}")
+
+            img_output = img_output.permute(1, 0, 2) # result: [63, 1, 128] --> [1, 63, 128]
+            pts_output = pts_output.permute(1, 0, 2)
+
+            # print ("1:1")
+            # img_output *=  1 #p_cam.reshape(img_output.shape[1], 1).cuda() # [1, 63, 128]
+            # pts_output *=  1 #p_lidar.reshape(img_output.shape[1], 1).cuda()
+
+            # print ("0:2")
+            # img_output *=  0 # p_cam.reshape(img_output.shape[1], 1).cuda() # [1, 63, 128]
+            # pts_output *=  2 #p_lidar.reshape(img_output.shape[1], 1).cuda()
+
+            print ("a:b")
+            img_output *=  2 * p_cam.reshape(img_output.shape[1], 1).cuda() # [1, 63, 128]
+            pts_output *=  2 * p_lidar.reshape(img_output.shape[1], 1).cuda()
+
+            img_output = img_output.permute(1, 0, 2) # result: [1, 63, 128] --> [63, 1, 128]
+            pts_output = pts_output.permute(1, 0, 2)
+            
+            return img_output, pts_output, top3_img_values, top3_img_indices, top3_pts_values, top3_pts_indices 
+
+            
+        # elif is_localization and not is_classification: # Second Stage: LiDAR only
+        #     print ("2nd: lidar only")
+        #     img_output *= 0.
+        #     pts_output *= 2.
+        #     return img_output, pts_output, None, None, None, None, None, None, None, None, None, None, None, None, None, None, 
+
+        # else: # Cam + LiDAR    
+        #     assert is_classification and is_localization
+        #     print ("3rd: cam + lidar")    
+        #     print ('2a', p_val_dict_next['alpha'][:5])
+        #     print ('2b', p_val_dict_next['beta'][:5])
+        #     img_output[:, : img_output.shape[1], :] *= 2 * p_val_dict_next['alpha'].view(900, 1) # torch.round(10 * p_val_dict_next[f'img5'].view(900, 1)) / 10
+        #     pts_output[:, : pts_output.shape[1], :] *= 2 * p_val_dict_next['beta'].view(900, 1) # torch.round(10 * p_val_dict_next[f'pts5'].view(900, 1)) / 10
+        #     return img_output, pts_output, None, None, None, None, None, None, None, None, None, None, None, None, None, None, 
+        
+
+    def forward(self, query, key, query_pos, key_pos, attn_mask=None, is_image_stage=False):
         """
         :param query: B C Pq
         :param key: B C Pk
@@ -89,37 +247,58 @@ class TransformerDecoderLayer(nn.Module):
         :return:
         """
         # NxCxP to PxNxC
-        if self.self_posembed is not None:
+        if self.self_posembed is not None: # True
             query_pos_embed = self.self_posembed(query_pos).permute(2, 0, 1)
         else:
             query_pos_embed = None
-        if self.cross_posembed is not None:
+        if self.cross_posembed is not None: # True
             key_pos_embed = self.cross_posembed(key_pos).permute(2, 0, 1)
         else:
             key_pos_embed = None
 
-        query = query.permute(2, 0, 1)
-        key = key.permute(2, 0, 1)
+        query = query.permute(2, 0, 1) # [1, 128, 14] --> [14, 1, 128]
+        key = key.permute(2, 0, 1) # [22400, 1, 128] (200 * 112 = 22400)
 
-        if not self.cross_only:
+        if not self.cross_only: # not self.cross_only = True (meaning: do self-attention on input query [14, 1, 128])
             q = k = v = self.with_pos_embed(query, query_pos_embed)
             query2 = self.self_attn(q, k, value=v)[0]
             query = query + self.dropout1(query2)
             query = self.norm1(query)
+            
+            
+        # print ("feature drop")
+        # key = torch.zeros(key.shape).cuda()
 
         query2 = self.multihead_attn(query=self.with_pos_embed(query, query_pos_embed),
                                      key=self.with_pos_embed(key, key_pos_embed),
                                      value=self.with_pos_embed(key, key_pos_embed), attn_mask=attn_mask)[0]
-        query = query + self.dropout2(query2)
+
+        if is_image_stage:
+            # def dynamic_weighting(self, img_output, pts_output):
+            pts_query_feat = query.clone()
+            img_query_feat = query2.clone()
+            
+            if True: #self.run_mode == "test": # and layer_id == 5:
+                img_query_feat, pts_query_feat, top3_img_values, top3_img_indices, top3_pts_values, top3_pts_indices  = self.dynamic_weighting(img_query_feat, pts_query_feat)
+                query = img_query_feat + pts_query_feat
+            else:
+                query = query + self.dropout2(query2)   ######## IF I want to use lidar only, comment out the query2 
+        else:
+            query = query + self.dropout2(query2) # [63, 1, 128]
+            
         query = self.norm2(query)
 
-        query2 = self.linear2(self.dropout(self.activation(self.linear1(query))))
+        query2 = self.linear2(self.dropout(self.activation(self.linear1(query)))) # query2.shape: [14, 1, 128]
         query = query + self.dropout3(query2)
         query = self.norm3(query)
 
         # NxCxP to PxNxC
-        query = query.permute(1, 2, 0)
-        return query
+        query = query.permute(1, 2, 0) # [63, 1, 128] --> [1, 128, 63]
+        
+        if is_image_stage:
+            return query, top3_img_values, top3_img_indices, top3_pts_values, top3_pts_indices  # top3_img_indices [63, 10]
+        else:
+            return query
 
 
 class MultiheadAttention(nn.Module):
@@ -322,19 +501,19 @@ def multi_head_attention_forward(query,  # type: Tensor
           L is the target sequence length, S is the source sequence length.
     """
 
-    qkv_same = torch.equal(query, key) and torch.equal(key, value)
-    kv_same = torch.equal(key, value)
+    qkv_same = torch.equal(query, key) and torch.equal(key, value) # cross: False
+    kv_same = torch.equal(key, value) # cross: True
 
     tgt_len, bsz, embed_dim = query.size()
-    assert embed_dim == embed_dim_to_check
-    assert list(query.size()) == [tgt_len, bsz, embed_dim]
-    assert key.size() == value.size()
+    assert embed_dim == embed_dim_to_check # 128
+    assert list(query.size()) == [tgt_len, bsz, embed_dim] # [85, 1, 128]
+    assert key.size() == value.size() # self: [85, 1, 128] & cross: [22400, 1, 128]
 
     head_dim = embed_dim // num_heads
     assert head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
     scaling = float(head_dim) ** -0.5
 
-    if use_separate_proj_weight is not True:
+    if use_separate_proj_weight is not True: # False: use identical proj weight 
         if qkv_same:
             # self-attention
             q, k, v = F.linear(query, in_proj_weight, in_proj_bias).chunk(3, dim=-1)
@@ -413,9 +592,9 @@ def multi_head_attention_forward(query,  # type: Tensor
             q = F.linear(query, q_proj_weight_non_opt, in_proj_bias)
             k = F.linear(key, k_proj_weight_non_opt, in_proj_bias)
             v = F.linear(value, v_proj_weight_non_opt, in_proj_bias)
-    q = q * scaling
+    q = q * scaling # q.shape: [85, 1, 128], k.shape: [22400, 1, 128], v.shape: [22400, 1, 128], but k =/= v
 
-    if bias_k is not None and bias_v is not None:
+    if bias_k is not None and bias_v is not None: # won't go inside this branch
         if static_k is None and static_v is None:
             k = torch.cat([k, bias_k.repeat(1, bsz, 1)])
             v = torch.cat([v, bias_v.repeat(1, bsz, 1)])
@@ -432,7 +611,7 @@ def multi_head_attention_forward(query,  # type: Tensor
         else:
             assert static_k is None, "bias cannot be added to static key."
             assert static_v is None, "bias cannot be added to static value."
-    else:
+    else: # go inside
         assert bias_k is None
         assert bias_v is None
 
@@ -458,7 +637,7 @@ def multi_head_attention_forward(query,  # type: Tensor
         assert key_padding_mask.size(0) == bsz
         assert key_padding_mask.size(1) == src_len
 
-    if add_zero_attn:
+    if add_zero_attn: # don't go inside
         src_len += 1
         k = torch.cat([k, torch.zeros((k.size(0), 1) + k.size()[2:], dtype=k.dtype, device=k.device)], dim=1)
         v = torch.cat([v, torch.zeros((v.size(0), 1) + v.size()[2:], dtype=v.dtype, device=v.device)], dim=1)
@@ -472,14 +651,14 @@ def multi_head_attention_forward(query,  # type: Tensor
                                                dtype=key_padding_mask.dtype,
                                                device=key_padding_mask.device)], dim=1)
 
-    attn_output_weights = torch.bmm(q, k.transpose(1, 2))
+    attn_output_weights = torch.bmm(q, k.transpose(1, 2)) # q: [8, 85, 16] & k: [8, 22400, 16] q * k^T: [8, 85, 22400]
     assert list(attn_output_weights.size()) == [bsz * num_heads, tgt_len, src_len]
 
-    if attn_mask is not None:
+    if attn_mask is not None: # go inside 
         attn_mask = attn_mask.unsqueeze(0)
         attn_output_weights += attn_mask
 
-    if key_padding_mask is not None:
+    if key_padding_mask is not None: # don't go inside 
         attn_output_weights = attn_output_weights.view(bsz, num_heads, tgt_len, src_len)
         attn_output_weights = attn_output_weights.masked_fill(
             key_padding_mask.unsqueeze(1).unsqueeze(2),
@@ -488,18 +667,18 @@ def multi_head_attention_forward(query,  # type: Tensor
         attn_output_weights = attn_output_weights.view(bsz * num_heads, tgt_len, src_len)
 
     attn_output_weights = F.softmax(
-        attn_output_weights, dim=-1)
+        attn_output_weights, dim=-1) # [8, 85, 22400] # attn_output_weights[0][0].sum() = 1 (softmax)!!
     attn_output_weights = F.dropout(attn_output_weights, p=dropout_p, training=training)
 
-    attn_output = torch.bmm(attn_output_weights, v)
-    assert list(attn_output.size()) == [bsz * num_heads, tgt_len, head_dim]
+    attn_output = torch.bmm(attn_output_weights, v) # att_out_weight: [8, 85, 22400] & v: [8, 22400, 16]
+    assert list(attn_output.size()) == [bsz * num_heads, tgt_len, head_dim] # tgt: q!
     attn_output = attn_output.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
     attn_output = F.linear(attn_output, out_proj_weight, out_proj_bias)
 
-    if need_weights:
+    if need_weights: # True
         # average attention weights over heads
-        attn_output_weights = attn_output_weights.view(bsz, num_heads, tgt_len, src_len)
-        return attn_output, attn_output_weights.sum(dim=1) / num_heads
+        attn_output_weights = attn_output_weights.view(bsz, num_heads, tgt_len, src_len) # [1, 8, 85, 22400]
+        return attn_output, attn_output_weights.sum(dim=1) / num_heads # attn_output: [85, 1, 128] & weight: [1, 85, 22400]
     else:
         return attn_output, None
 
@@ -879,7 +1058,7 @@ class TransFusionHead(nn.Module):
         # transformer decoder layer (LiDAR feature as K,V)
         #################################
         ret_dicts = []
-        for i in range(self.num_decoder_layers):
+        for i in range(self.num_decoder_layers): # num_decoder_layers: 1
             prefix = 'last_' if (i == self.num_decoder_layers - 1) else f'{i}head_'
 
             # Transformer Decoder Layer
@@ -890,7 +1069,7 @@ class TransFusionHead(nn.Module):
             res_layer = self.prediction_heads[i](query_feat)
             res_layer['center'] = res_layer['center'] + query_pos.permute(0, 2, 1)
             first_res_layer = res_layer
-            if not self.fuse_img:
+            if not self.fuse_img: # mk: ignore this!
                 ret_dicts.append(res_layer)
 
             # for next level positional embedding
@@ -898,6 +1077,7 @@ class TransFusionHead(nn.Module):
 
         #################################
         # transformer decoder layer (img feature as K,V)
+        # MK 
         #################################
         if self.fuse_img:
             # positional encoding for image fusion
@@ -909,15 +1089,19 @@ class TransFusionHead(nn.Module):
             else:
                 img_feat_pos = self.img_feat_pos
 
-            prev_query_feat = query_feat.detach().clone()
-            query_feat = torch.zeros_like(query_feat)  # create new container for img query feature
-            query_pos_realmetric = query_pos.permute(0, 2, 1) * self.test_cfg['out_size_factor'] * self.test_cfg['voxel_size'][0] + self.test_cfg['pc_range'][0]
+            prev_query_feat = query_feat.detach().clone() # from lidar only (1st decoder)
+            query_feat = torch.zeros_like(query_feat)  # create new container for img query feature [1, 128, 200]
+            total_camera_feats, total_lidar_feats = torch.zeros_like(query_feat), torch.zeros_like(query_feat)
+            nc_camera_feats, nc_lidar_feats = torch.zeros(1, 10, 200).to(torch.float64), torch.zeros(1, 10, 200).to(torch.float64)
+            idx_camera_feats, idx_lidar_feats = torch.zeros(1, 10, 200).to(torch.float64), torch.zeros(1, 10, 200).to(torch.float64)
+            
+            query_pos_realmetric = query_pos.permute(0, 2, 1) * self.test_cfg['out_size_factor'] * self.test_cfg['voxel_size'][0] + self.test_cfg['pc_range'][0] # ([1, 2, 200])
             query_pos_3d = torch.cat([query_pos_realmetric, res_layer['height']], dim=1).detach().clone()
             if 'vel' in res_layer:
                 vel = copy.deepcopy(res_layer['vel'].detach())
             else:
                 vel = None
-            pred_boxes = self.bbox_coder.decode(
+            pred_boxes = self.bbox_coder.decode( # res_layer is from 1st lidar-only decoder 
                 copy.deepcopy(res_layer['heatmap'].detach()),
                 copy.deepcopy(res_layer['rot'].detach()),
                 copy.deepcopy(res_layer['dim'].detach()),
@@ -928,8 +1112,19 @@ class TransFusionHead(nn.Module):
 
             on_the_image_mask = torch.ones([batch_size, self.num_proposals]).to(query_pos_3d.device) * -1
 
-            for sample_idx in range(batch_size if self.fuse_img else 0):
+            for sample_idx in range(batch_size if self.fuse_img else 0): # 1
+                #Put random noise to each image feature
+                # print (f"corruption: misalginment")
+                # for i in range(6):  
+                #     noise = torch.FloatTensor(4, 4).uniform_(-2, 2).numpy()
+                #     # print (img_metas[sample_idx]['lidar2img'][i])
+                #     img_metas[sample_idx]['lidar2img'][i] += noise
+
+                #     # print (img_metas[sample_idx]['lidar2img'][i])
+
                 lidar2img_rt = query_pos_3d.new_tensor(img_metas[sample_idx]['lidar2img'])
+
+
                 img_scale_factor = (
                     query_pos_3d.new_tensor(img_metas[sample_idx]['scale_factor'][:2]
                                             if 'scale_factor' in img_metas[sample_idx].keys() else [1.0, 1.0]))
@@ -937,18 +1132,18 @@ class TransFusionHead(nn.Module):
                 img_crop_offset = (
                     query_pos_3d.new_tensor(img_metas[sample_idx]['img_crop_offset'])
                     if 'img_crop_offset' in img_metas[sample_idx].keys() else 0)
-                img_shape = img_metas[sample_idx]['img_shape'][:2]
-                img_pad_shape = img_metas[sample_idx]['input_shape'][:2]
-                boxes = LiDARInstance3DBoxes(pred_boxes[sample_idx]['bboxes'][:, :7], box_dim=7)
+                img_shape = img_metas[sample_idx]['img_shape'][:2] # (448, 796)
+                img_pad_shape = img_metas[sample_idx]['input_shape'][:2] # [448, 800]
+                boxes = LiDARInstance3DBoxes(pred_boxes[sample_idx]['bboxes'][:, :7], box_dim=7) # (200, 7)
                 query_pos_3d_with_corners = torch.cat([query_pos_3d[sample_idx], boxes.corners.permute(2, 0, 1).view(3, -1)], dim=-1)  # [3, num_proposals] + [3, num_proposals*8]
                 # transform point clouds back to original coordinate system by reverting the data augmentation
                 if batch_size == 1:  # skip during inference to save time
                     points = query_pos_3d_with_corners.T
                 else:
                     points = apply_3d_transformation(query_pos_3d_with_corners.T, 'LIDAR', img_metas[sample_idx], reverse=True).detach()
-                num_points = points.shape[0]
+                num_points = points.shape[0] # 1800
 
-                for view_idx in range(self.num_views):
+                for view_idx in range(self.num_views): # 6
                     pts_4d = torch.cat([points, points.new_ones(size=(num_points, 1))], dim=-1)
                     pts_2d = pts_4d @ lidar2img_rt[view_idx].t()
 
@@ -977,8 +1172,8 @@ class TransFusionHead(nn.Module):
                     coor_corner_xy = torch.cat([coor_corner_x, coor_corner_y], dim=-1)
 
                     h, w = img_pad_shape
-                    on_the_image = (coor_x > 0) * (coor_x < w) * (coor_y > 0) * (coor_y < h)
-                    on_the_image = on_the_image.squeeze()
+                    on_the_image = (coor_x > 0) * (coor_x < w) * (coor_y > 0) * (coor_y < h) # shae is [200] but only 21 elements are True (on the image)
+                    on_the_image = on_the_image.squeeze() # [200]
                     # skip the following computation if no object query fall on current image
                     if on_the_image.sum() <= 1:
                         continue
@@ -994,15 +1189,19 @@ class TransFusionHead(nn.Module):
                     distance = (centers[:, None, :] - (img_feat_pos - 0.5)).norm(dim=-1) ** 2
                     gaussian_mask = (-distance / (2 * sigma[:, None] ** 2)).exp()
                     gaussian_mask[gaussian_mask < torch.finfo(torch.float32).eps] = 0
-                    attn_mask = gaussian_mask
+                    attn_mask = gaussian_mask # (85, 22400) # (# proposals, HW)
 
-                    query_feat_view = prev_query_feat[sample_idx, :, on_the_image]
-                    query_pos_view = torch.cat([center_xs, center_ys], dim=-1)
-                    query_feat_view = self.decoder[self.num_decoder_layers](query_feat_view[None], img_feat_flatten[sample_idx:sample_idx + 1, view_idx], query_pos_view[None], img_feat_pos, attn_mask=attn_mask.log())
-                    query_feat[sample_idx, :, on_the_image] = query_feat_view.clone()
+                    query_feat_view = prev_query_feat[sample_idx, :, on_the_image] # [128, 21]
+                    query_pos_view = torch.cat([center_xs, center_ys], dim=-1) # [21, 2]
+                    query_feat_view, top3_img_values, top3_img_indices, top3_pts_values, top3_pts_indices  = self.decoder[self.num_decoder_layers](query_feat_view[None], img_feat_flatten[sample_idx:sample_idx + 1, view_idx], query_pos_view[None], img_feat_pos, attn_mask=attn_mask.log(), is_image_stage=True) # result: [1, 128, 21]
+                    query_feat[sample_idx, :, on_the_image] = query_feat_view.clone() # query_feat_view: [1, 128, 63]
+                    # total_camera_feats[sample_idx, :, on_the_image] = camera_feats.permute(2, 0, 1).squeeze(2).clone()
+                    # total_lidar_feats[sample_idx, :, on_the_image] = lidar_feats.permute(2, 0, 1).squeeze(2).clone()
+                    nc_camera_feats[sample_idx, :, on_the_image], idx_camera_feats[sample_idx, :, on_the_image]  = top3_img_values.transpose(1, 0).clone(), top3_img_indices.transpose(1, 0).clone().to(torch.float64) # [10, 63]
+                    nc_lidar_feats[sample_idx, :, on_the_image], idx_lidar_feats[sample_idx, :, on_the_image]  = top3_pts_values.transpose(1, 0).clone(), top3_pts_indices.transpose(1, 0).clone().to(torch.float64) # [10, 63]
 
             self.on_the_image_mask = (on_the_image_mask != -1)
-            res_layer = self.prediction_heads[self.num_decoder_layers](torch.cat([query_feat, prev_query_feat], dim=1))
+            res_layer = self.prediction_heads[self.num_decoder_layers](torch.cat([query_feat, prev_query_feat], dim=1)) # torch.cat([query_feat, prev_query_feat], dim=1).shape: [1, 256, 200]
             res_layer['center'] = res_layer['center'] + query_pos.permute(0, 2, 1)
             for key, value in res_layer.items():
                 pred_dim = value.shape[1]
@@ -1016,7 +1215,7 @@ class TransFusionHead(nn.Module):
             else:
                 ret_dicts[0]['dense_heatmap'] = dense_heatmap
 
-        if self.auxiliary is False:
+        if self.auxiliary is False: # don't go inside
             # only return the results of last decoder layer
             return [ret_dicts[-1]]
 
@@ -1027,7 +1226,7 @@ class TransFusionHead(nn.Module):
                 new_res[key] = torch.cat([ret_dict[key] for ret_dict in ret_dicts], dim=-1)
             else:
                 new_res[key] = ret_dicts[0][key]
-        return [new_res]
+        return [new_res], nc_camera_feats, nc_lidar_feats, idx_camera_feats, idx_lidar_feats
 
     def forward(self, feats, img_feats, img_metas):
         """Forward pass.
@@ -1041,9 +1240,9 @@ class TransFusionHead(nn.Module):
         """
         if img_feats is None:
             img_feats = [None]
-        res = multi_apply(self.forward_single, feats, img_feats, [img_metas])
+        res, nc_camera_feats, nc_lidar_feats, idx_camera_feats, idx_lidar_feats = multi_apply(self.forward_single, feats, img_feats, [img_metas])
         assert len(res) == 1, "only support one level features."
-        return res
+        return res, nc_camera_feats[0], nc_lidar_feats[0], idx_camera_feats[0], idx_lidar_feats[0]
 
     def get_targets(self, gt_bboxes_3d, gt_labels_3d, preds_dict):
         """Generate training targets.
